@@ -1,0 +1,20 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.amol.amr.app-mergeDebugResources-55:/values-hdpi-v4/values-hdpi-v4.xml",
+            "map": [
+                {
+                    "source": "C:\\Users\\kadam\\.gradle\\caches\\8.9\\transforms\\f7582e6232caa30d879612aadc33b71e\\transformed\\appcompat-1.1.0\\res\\values-hdpi-v4\\values-hdpi-v4.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endLines": "6",
+                        "endColumns": "13",
+                        "endOffsets": "327"
+                    }
+                }
+            ]
+        }
+    ]
+}

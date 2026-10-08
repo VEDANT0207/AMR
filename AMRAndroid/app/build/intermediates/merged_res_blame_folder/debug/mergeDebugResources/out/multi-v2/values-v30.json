@@ -1,0 +1,19 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.amol.amr.app-mergeDebugResources-55:/values-v30/values-v30.xml",
+            "map": [
+                {
+                    "source": "C:\\Users\\kadam\\.gradle\\caches\\8.9\\transforms\\a8d6a2b201eda1ed3cb4f3a7a7f740b4\\transformed\\material3-release\\res\\values-v30\\values-v30.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endColumns": "72",
+                        "endOffsets": "123"
+                    }
+                }
+            ]
+        }
+    ]
+}

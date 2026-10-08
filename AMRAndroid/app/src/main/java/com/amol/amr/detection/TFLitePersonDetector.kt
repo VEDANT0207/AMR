@@ -19,7 +19,7 @@ import kotlin.math.min
 
 class TFLitePersonDetector(
     private val context: Context,
-    private val modelPath: String = "models/yolov8n_float32.tflite",
+    private val modelPath: String = "models/yolov8n_pose_float32.tflite",
     private val inputSize: Int = 640,
     private val confThreshold: Float = 0.45f,
     private val iouThreshold: Float = 0.50f,
@@ -104,7 +104,7 @@ class TFLitePersonDetector(
 
         val scaledBitmap = Bitmap.createScaledBitmap(rotatedBitmap, inputSize, inputSize, true)
 
-        // 2. Preprocess into FloatBuffer [1, 640, 640, 3] normalized [0.0 .. 1.0]
+        // 2. Preprocess into FloatBuffer [1, 640, 640, 3] normalized [0.0 .. 1.0] (NHWC)
         inputBuffer.rewind()
         scaledBitmap.getPixels(intValues, 0, inputSize, 0, 0, inputSize, inputSize)
 
@@ -117,13 +117,14 @@ class TFLitePersonDetector(
             inputBuffer.putFloat(b)
         }
 
-        // 3. Output shape for YOLOv8: [1, 84, 8400] (for 80 classes + 4 bbox coords) or [1, 5, 8400]
-        val outputArray = Array(1) { Array(84) { FloatArray(8400) } }
+        // 3. Output shape for YOLOv8-Pose: [1, 56, 8400]
+        // 56 channels = 4 bbox (cx, cy, w, h normalized [0..1]) + 1 person confidence + 17 keypoints * 3 (x, y, conf)
+        val outputArray = Array(1) { Array(56) { FloatArray(8400) } }
         val outputMap = mapOf(0 to outputArray)
 
         interpreter?.runForMultipleInputsOutputs(arrayOf(inputBuffer), outputMap)
 
-        // 4. Post-process detections for Person Class (Class Index 0)
+        // 4. Post-process detections for Person Class (Channel 4 = confidence)
         val rawCandidates = mutableListOf<Detection>()
         val numBoxes = 8400
 
@@ -132,13 +133,13 @@ class TFLitePersonDetector(
             val cy = outputArray[0][1][i]
             val w = outputArray[0][2][i]
             val h = outputArray[0][3][i]
-            val personConf = outputArray[0][4][i] // Class 0 confidence
+            val personConf = outputArray[0][4][i] // Person confidence
 
             if (personConf >= confThreshold) {
-                val x1Norm = (cx - w / 2.0f) / inputSize.toFloat()
-                val y1Norm = (cy - h / 2.0f) / inputSize.toFloat()
-                val x2Norm = (cx + w / 2.0f) / inputSize.toFloat()
-                val y2Norm = (cy + h / 2.0f) / inputSize.toFloat()
+                val x1Norm = cx - w / 2.0f
+                val y1Norm = cy - h / 2.0f
+                val x2Norm = cx + w / 2.0f
+                val y2Norm = cy + h / 2.0f
 
                 val x1 = (x1Norm * frameW).coerceIn(0.0f, frameW.toFloat())
                 val y1 = (y1Norm * frameH).coerceIn(0.0f, frameH.toFloat())
@@ -146,12 +147,25 @@ class TFLitePersonDetector(
                 val y2 = (y2Norm * frameH).coerceIn(0.0f, frameH.toFloat())
 
                 if (x2 > x1 && y2 > y1) {
+                    // Extract 17 keypoints (51 float values: x, y, conf)
+                    val keypoints = FloatArray(51)
+                    for (k in 0 until 17) {
+                        val kpXNorm = outputArray[0][5 + k * 3][i]
+                        val kpYNorm = outputArray[0][5 + k * 3 + 1][i]
+                        val kpConf = outputArray[0][5 + k * 3 + 2][i]
+
+                        keypoints[k * 3] = (kpXNorm * frameW).coerceIn(0.0f, frameW.toFloat())
+                        keypoints[k * 3 + 1] = (kpYNorm * frameH).coerceIn(0.0f, frameH.toFloat())
+                        keypoints[k * 3 + 2] = kpConf
+                    }
+
                     rawCandidates.add(
                         Detection(
                             classId = 0,
                             label = "person",
                             confidence = personConf,
-                            boundingBox = BoundingBox(x1, y1, x2, y2)
+                            boundingBox = BoundingBox(x1, y1, x2, y2),
+                            keypoints = keypoints
                         )
                     )
                 }

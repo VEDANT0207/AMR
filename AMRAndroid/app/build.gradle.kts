@@ -78,7 +78,7 @@ dependencies {
     implementation(libs.tensorflow.lite.support)
 
     // USB Serial
-    implementation(libs.usb.serial.for.android)
+    implementation(libs.usb.serial.`for`.android)
 
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)

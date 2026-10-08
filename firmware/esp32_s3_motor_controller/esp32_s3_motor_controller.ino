@@ -1,34 +1,38 @@
 /**
  * ESP32-S3 Unified Customer-Aware Autonomous Mobile Robot (AMR) Firmware
  * 
- * Preserves existing working AMR hardware subsystems:
- *  1. L298N Differential Drive Motors (PWM speed & direction)
- *  2. HC-SR04 Ultrasonic Distance Sensor & Servo (Hardware close-range safety bumper)
- *  3. MPU6050 6-DOF IMU (I2C Tilt & Collision safety)
- *  4. High-Speed USB-CDC / UART Serial Command Parser (from Android YOLO)
- *  5. 500ms Communication Watchdog Failsafe
+ * Hardware Subsystems (Verified from hardware/ sketches):
+ *  1. TB6612FNG Dual H-Bridge Motor Driver (PWMA=16, PWMB=4, AIN1=14, AIN2=15, BIN1=17, BIN2=18, STBY=12)
+ *  2. HC-SR04 Ultrasonic Distance Sensor (TRIG=21, ECHO=47) on Servo (SERVO=13)
+ *  3. MPU6050 6-DOF IMU (I2C SDA=8, SCL=9, Addr=0x68) for Tilt & Rollover Safety
+ *  4. High-Speed USB-CDC / UART Serial (115200 Baud) Command Receiver from Android YOLOv8-Pose
+ *  5. 500ms Hardware Communication Watchdog Failsafe
  * 
- * SAFETY PRIORITY MATRIX:
- *  [1] EMERGENCY STOP (UI / Command Override)
- *  [2] Ultrasonic Obstacle Safety (Front Distance < 20cm)
- *  [3] Communication Watchdog (Timeout > 500ms)
- *  [4] MPU6050 Tilt / Impact Failsafe (Pitch/Roll > 20 deg)
- *  [5] Android YOLO Perception Commands (STEER / SPEED)
+ * SAFETY ARBITRATION PRIORITY MATRIX:
+ *  [Tier 1] EMERGENCY STOP (Android UI / STOP Command Override)
+ *  [Tier 2] Ultrasonic Obstacle Safety (Front Distance < 20cm Proximity Bumper)
+ *  [Tier 3] Communication Watchdog (Timeout > 500ms -> Immediate Motor Halt)
+ *  [Tier 4] MPU6050 Tilt / Impact Failsafe (Pitch / Roll > 25.0 deg)
+ *  [Tier 5] Android YOLO Navigation Commands (Differential Drive STEER & SPEED)
  */
 
 #include <Arduino.h>
 #include <Wire.h>
 #include <ESP32Servo.h>
 
-// ================= MOTOR PIN CONFIGURATION (L298N) =================
-// Default matching working hardware: IN1=14, IN2=15, IN3=17, IN4=18, ENA=16, ENB=4
-#define PIN_IN1 14
-#define PIN_IN2 15
-#define PIN_IN3 17
-#define PIN_IN4 18
+// ================= TB6612FNG MOTOR DRIVER PIN CONFIGURATION =================
+// Left Motor (Motor A)
+#define AIN1 14
+#define AIN2 15
+#define PWMA 16
 
-#define PIN_ENA 16
-#define PIN_ENB 4
+// Right Motor (Motor B)
+#define BIN1 17
+#define BIN2 18
+#define PWMB 4
+
+// Standby Pin (Must be pulled HIGH to enable TB6612FNG bridge)
+#define STBY 12
 
 // ================= PWM CHANNELS & FREQUENCY =================
 #define PWM_FREQ 5000
@@ -67,7 +71,7 @@ bool emergencyStopRequested = false;
 // ================= FUNCTION DECLARATIONS =================
 void stopMotors();
 void setMotorSpeeds(int leftPwm, int rightPwm);
-void parseSerialCommand(String cmd);
+bool parseSerialCommand(String cmd);
 long readUltrasonicDistance();
 bool initMPU6050();
 bool checkIMUSafety();
@@ -75,35 +79,43 @@ void executeMovementControl();
 
 // ================= SETUP =================
 void setup() {
-  // 1. Initialize Serial for Android USB OTG Communication
+  // 1. Initialize Serial for Android USB-C OTG Communication
   Serial.begin(115200);
   delay(1000);
   Serial.println("STATUS:AMR_UNIFIED_FIRMWARE_INITIALIZING");
 
-  // 2. Setup Motor GPIOs
-  pinMode(PIN_IN1, OUTPUT);
-  pinMode(PIN_IN2, OUTPUT);
-  pinMode(PIN_IN3, OUTPUT);
-  pinMode(PIN_IN4, OUTPUT);
+  // 2. Setup TB6612FNG Motor GPIOs
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+  pinMode(STBY, OUTPUT);
+
+  // Enable TB6612FNG Motor Driver
+  digitalWrite(STBY, HIGH);
 
   // Setup PWM Channels
   ledcSetup(PWM_CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
   ledcSetup(PWM_CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(PIN_ENA, PWM_CHANNEL_A);
-  ledcAttachPin(PIN_ENB, PWM_CHANNEL_B);
+  ledcAttachPin(PWMA, PWM_CHANNEL_A);
+  ledcAttachPin(PWMB, PWM_CHANNEL_B);
 
-  // 3. Setup Ultrasonic & Servo
+  Serial.println("STATUS:MOTOR_DRIVER:TB6612FNG");
+
+  // 3. Setup Ultrasonic & Servo Subsystems
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
   scanServo.attach(SERVO_PIN);
-  scanServo.write(90); // Center forward position
+  scanServo.write(90); // Initial Center forward position
+  Serial.println("STATUS:ULTRASONIC:ONLINE");
+  Serial.println("STATUS:SERVO:ONLINE");
 
-  // 4. Setup I2C & MPU6050
+  // 4. Setup I2C & MPU6050 IMU
   Wire.begin(PIN_SDA, PIN_SCL, 400000);
   bool imuOk = initMPU6050();
   if (imuOk) {
-    Serial.println("STATUS:MPU6050_ONLINE");
+    Serial.println("STATUS:MPU6050:ONLINE");
   } else {
     Serial.println("STATUS:MPU6050_NOT_DETECTED_CONTINUING");
   }
@@ -114,6 +126,7 @@ void setup() {
   isFailsafeActive = true;
 
   Serial.println("STATUS:READY_FOR_ANDROID_COMMANDS");
+  Serial.println("STATUS:USB_COMMANDS:READY");
 }
 
 // ================= MAIN LOOP =================
@@ -125,9 +138,13 @@ void loop() {
     String line = Serial.readStringUntil('\n');
     line.trim();
     if (line.length() > 0) {
-      parseSerialCommand(line);
-      lastCommandTime = now;
-      isFailsafeActive = false;
+      bool valid = parseSerialCommand(line);
+      if (valid) {
+        lastCommandTime = now;
+        isFailsafeActive = false;
+      } else {
+        Serial.println("ERROR:INVALID_COMMAND");
+      }
     }
   }
 
@@ -159,6 +176,7 @@ void loop() {
 
 /**
  * Multi-Tier Safety Execution Arbiter
+ * Guarantees Android commands CANNOT bypass hardware safety triggers.
  */
 void executeMovementControl() {
   // Tier 1: Emergency Stop Command from Android UI
@@ -187,7 +205,7 @@ void executeMovementControl() {
     return;
   }
 
-  // Tier 5 & 6: Execute YOLO Navigation Movement Command
+  // Tier 5: Execute YOLO Navigation Movement Command
   if (targetSpeedScale <= 0.01) {
     stopMotors();
     return;
@@ -206,18 +224,18 @@ void executeMovementControl() {
 }
 
 /**
- * Parses both Compact ("STEER:X SPEED:Y" / "STOP") 
- * and CSV ("CMD,DIR,PWM,STEER,STOP_FLAG,SEQ") protocols
+ * Parses both CSV ("CMD,DIR,PWM,STEER,STOP_FLAG,SEQ") 
+ * and Compact ("STEER:X SPEED:Y" / "STOP") protocols.
+ * Returns true if the command is valid.
  */
-void parseSerialCommand(String cmd) {
+bool parseSerialCommand(String cmd) {
+  // Emergency stop check
   if (cmd == "STOP" || cmd.startsWith("CMD,STOP")) {
     emergencyStopRequested = true;
     targetSpeedScale = 0.0;
     stopMotors();
-    return;
+    return true;
   }
-
-  emergencyStopRequested = false;
 
   if (cmd.startsWith("STEER:")) {
     // Compact format: STEER:15 SPEED:0.75
@@ -225,7 +243,10 @@ void parseSerialCommand(String cmd) {
     if (speedIndex != -1) {
       targetSteering = cmd.substring(6, speedIndex).toFloat();
       targetSpeedScale = cmd.substring(speedIndex + 6).toFloat();
+      emergencyStopRequested = false;
+      return true;
     }
+    return false;
   } else if (cmd.startsWith("CMD,")) {
     // CSV format: CMD,DIRECTION,PWM,STEER,STOP_FLAG,SEQ
     int firstComma = cmd.indexOf(',');
@@ -236,18 +257,25 @@ void parseSerialCommand(String cmd) {
 
     if (firstComma != -1 && secondComma != -1 && thirdComma != -1 && fourthComma != -1) {
       int pwmVal = cmd.substring(secondComma + 1, thirdComma).toInt();
-      targetSteering = cmd.substring(thirdComma + 1, fourthComma).toFloat();
+      float steer = cmd.substring(thirdComma + 1, fourthComma).toFloat();
       int stopFlag = cmd.substring(fourthComma + 1, fifthComma != -1 ? fifthComma : cmd.length()).toInt();
 
       if (stopFlag == 1) {
         emergencyStopRequested = true;
         targetSpeedScale = 0.0;
         stopMotors();
-        return;
+        return true;
       }
-      targetSpeedScale = (float)pwmVal / 255.0f;
+
+      emergencyStopRequested = false;
+      targetSteering = steer;
+      targetSpeedScale = constrain((float)pwmVal / 255.0f, 0.0f, 1.0f);
+      return true;
     }
+    return false;
   }
+
+  return false;
 }
 
 /**
@@ -255,12 +283,12 @@ void parseSerialCommand(String cmd) {
  */
 long readUltrasonicDistance() {
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(4);
+  delayMicroseconds(5);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 25000); // 25ms timeout (~4 meters)
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout (~5 meters)
   if (duration == 0) {
     return 999;
   }
@@ -308,32 +336,32 @@ bool checkIMUSafety() {
 }
 
 /**
- * Sets PWM duty cycle and direction for L298N driver
+ * Sets PWM duty cycle and direction for TB6612FNG driver
  */
 void setMotorSpeeds(int leftPwm, int rightPwm) {
   leftPwm = constrain(leftPwm, 0, 255);
   rightPwm = constrain(rightPwm, 0, 255);
 
-  // Forward Direction
-  digitalWrite(PIN_IN1, HIGH);
-  digitalWrite(PIN_IN2, LOW);
-  digitalWrite(PIN_IN3, HIGH);
-  digitalWrite(PIN_IN4, LOW);
+  // Forward Direction Polarity (matching hardware/ultrasonic-tfng-auto-test.cpp)
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, HIGH);
+  digitalWrite(BIN2, LOW);
 
-  // Apply PWM speeds
+  // Apply PWM speeds to TB6612FNG PWMA and PWMB
   ledcWrite(PWM_CHANNEL_A, leftPwm);
   ledcWrite(PWM_CHANNEL_B, rightPwm);
 }
 
 /**
- * Immediate Hardware Stop
+ * Immediate Hardware Stop for TB6612FNG
  */
 void stopMotors() {
   ledcWrite(PWM_CHANNEL_A, 0);
   ledcWrite(PWM_CHANNEL_B, 0);
 
-  digitalWrite(PIN_IN1, LOW);
-  digitalWrite(PIN_IN2, LOW);
-  digitalWrite(PIN_IN3, LOW);
-  digitalWrite(PIN_IN4, LOW);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
 }
