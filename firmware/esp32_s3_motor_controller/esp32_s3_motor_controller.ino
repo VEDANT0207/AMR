@@ -1,7 +1,7 @@
 /**
  * ESP32-S3 Unified Customer-Aware Autonomous Mobile Robot (AMR) Firmware
  * 
- * Hardware Subsystems (Verified from hardware/ sketches):
+ * Hardware Subsystems:
  *  1. TB6612FNG Dual H-Bridge Motor Driver (PWMA=16, PWMB=4, AIN1=14, AIN2=15, BIN1=17, BIN2=18, STBY=12)
  *  2. HC-SR04 Ultrasonic Distance Sensor (TRIG=21, ECHO=47) on Servo (SERVO=13)
  *  3. MPU6050 6-DOF IMU (I2C SDA=8, SCL=9, Addr=0x68) for Tilt & Rollover Safety
@@ -10,7 +10,7 @@
  * 
  * SAFETY ARBITRATION PRIORITY MATRIX:
  *  [Tier 1] EMERGENCY STOP (Android UI / STOP Command Override)
- *  [Tier 2] Ultrasonic Obstacle Safety (Front Distance < 20cm Proximity Bumper)
+ *  [Tier 2] Ultrasonic Obstacle Safety (Front Distance < 22cm Proximity Bumper)
  *  [Tier 3] Communication Watchdog (Timeout > 500ms -> Immediate Motor Halt)
  *  [Tier 4] MPU6050 Tilt / Impact Failsafe (Pitch / Roll > 25.0 deg)
  *  [Tier 5] Android YOLO Navigation Commands (Differential Drive STEER & SPEED)
@@ -40,13 +40,30 @@
 #define PWM_CHANNEL_A 0
 #define PWM_CHANNEL_B 1
 
+// ================= SPEED SCALING & SMOOTHING =================
+// Reduced by ~40% for controlled, safe mobile robot locomotion
+#define SPEED_SCALE_FACTOR 0.60f
+#define MAX_MOTOR_PWM 150
+
 // ================= ULTRASONIC SENSOR & SERVO =================
 #define TRIG_PIN 21
 #define ECHO_PIN 47
 #define SERVO_PIN 13
-#define OBSTACLE_DISTANCE_THRESHOLD_CM 20
+#define OBSTACLE_DISTANCE_THRESHOLD_CM 22
 
 Servo scanServo;
+
+// Non-blocking smooth sweeping range (55 deg to 125 deg)
+#define SERVO_MIN_ANGLE 55
+#define SERVO_MAX_ANGLE 125
+#define SERVO_STEP 3
+#define SERVO_INTERVAL_MS 40
+
+int currentServoAngle = 90;
+int servoScanDirection = 1;
+unsigned long lastServoMoveTime = 0;
+
+int obstacleConsecutiveHits = 0;
 
 // ================= MPU6050 IMU CONFIGURATION =================
 #define MPU6050_ADDR 0x68
@@ -59,6 +76,7 @@ Servo scanServo;
 
 unsigned long lastCommandTime = 0;
 unsigned long lastSensorPollTime = 0;
+bool imuAvailable = false;
 bool isFailsafeActive = true;
 bool isObstacleDetected = false;
 bool isImuTiltFault = false;
@@ -76,6 +94,7 @@ long readUltrasonicDistance();
 bool initMPU6050();
 bool checkIMUSafety();
 void executeMovementControl();
+void updateServo();
 
 // ================= SETUP =================
 void setup() {
@@ -101,20 +120,23 @@ void setup() {
   ledcAttachPin(PWMB, PWM_CHANNEL_B);
 
   Serial.println("STATUS:MOTOR_DRIVER:TB6612FNG");
+  Serial.printf("STATUS:SPEED_SCALE:%.2f (MAX_PWM:%d)\n", SPEED_SCALE_FACTOR, MAX_MOTOR_PWM);
 
   // 3. Setup Ultrasonic & Servo Subsystems
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
 
   scanServo.attach(SERVO_PIN);
-  scanServo.write(90); // Initial Center forward position
+  scanServo.write(currentServoAngle); // Initial Center forward position
+  lastServoMoveTime = millis();
   Serial.println("STATUS:ULTRASONIC:ONLINE");
-  Serial.println("STATUS:SERVO:ONLINE");
+  Serial.println("STATUS:SERVO_SCANNING:ONLINE");
 
   // 4. Setup I2C & MPU6050 IMU
   Wire.begin(PIN_SDA, PIN_SCL, 400000);
-  bool imuOk = initMPU6050();
-  if (imuOk) {
+  imuAvailable = initMPU6050();
+  if (imuAvailable) {
     Serial.println("STATUS:MPU6050:ONLINE");
   } else {
     Serial.println("STATUS:MPU6050_NOT_DETECTED_CONTINUING");
@@ -133,7 +155,10 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // 1. Read Serial Command Stream from Android Phone
+  // 1. Continuous Non-Blocking Servo Scanning
+  updateServo();
+
+  // 2. Read Serial Command Stream from Android Phone
   while (Serial.available() > 0) {
     String line = Serial.readStringUntil('\n');
     line.trim();
@@ -148,30 +173,66 @@ void loop() {
     }
   }
 
-  // 2. Periodic Sensor Polling (every 50ms)
+  // 3. Periodic Sensor Polling (every 50ms)
   if (now - lastSensorPollTime >= 50) {
     lastSensorPollTime = now;
 
-    // Check Ultrasonic Proximity
+    // Check Ultrasonic Proximity with spike & outlier filtering
     long distance = readUltrasonicDistance();
-    if (distance > 0 && distance < OBSTACLE_DISTANCE_THRESHOLD_CM) {
-      isObstacleDetected = true;
+    if (distance > 2 && distance < OBSTACLE_DISTANCE_THRESHOLD_CM) {
+      obstacleConsecutiveHits++;
+      // Require 2 consecutive close readings to prevent false triggers
+      if (obstacleConsecutiveHits >= 2) {
+        isObstacleDetected = true;
+      }
     } else {
-      isObstacleDetected = false;
+      if (obstacleConsecutiveHits > 0) {
+        obstacleConsecutiveHits--;
+      }
+      if (obstacleConsecutiveHits == 0) {
+        isObstacleDetected = false;
+      }
     }
 
-    // Check IMU Tilt
-    isImuTiltFault = !checkIMUSafety();
+    // Check IMU Tilt only if IMU was detected at startup
+    if (imuAvailable) {
+      isImuTiltFault = !checkIMUSafety();
+    } else {
+      isImuTiltFault = false;
+    }
   }
 
-  // 3. Check Communication Watchdog (500ms timeout)
+  // 4. Check Communication Watchdog (500ms timeout)
   if (!isFailsafeActive && (now - lastCommandTime > WATCHDOG_TIMEOUT_MS)) {
     isFailsafeActive = true;
     Serial.println("STATUS:WATCHDOG_TRIGGERED_MOTORS_HALTED");
   }
 
-  // 4. Multi-Tier Movement Arbitration
+  // 5. Multi-Tier Movement Arbitration
   executeMovementControl();
+}
+
+/**
+ * Non-blocking Servo Scanning Routine
+ * Smoothly oscillates the SG90 back and forth between 55 and 125 degrees.
+ */
+void updateServo() {
+  unsigned long now = millis();
+  if (now - lastServoMoveTime >= SERVO_INTERVAL_MS) {
+    lastServoMoveTime = now;
+
+    currentServoAngle += servoScanDirection * SERVO_STEP;
+
+    if (currentServoAngle >= SERVO_MAX_ANGLE) {
+      currentServoAngle = SERVO_MAX_ANGLE;
+      servoScanDirection = -1;
+    } else if (currentServoAngle <= SERVO_MIN_ANGLE) {
+      currentServoAngle = SERVO_MIN_ANGLE;
+      servoScanDirection = 1;
+    }
+
+    scanServo.write(currentServoAngle);
+  }
 }
 
 /**
@@ -188,7 +249,6 @@ void executeMovementControl() {
   // Tier 2: Ultrasonic Obstacle Safety (Hardware Proximity Bumper)
   if (isObstacleDetected) {
     stopMotors();
-    Serial.println("SAFETY_TRIGGER:ULTRASONIC_CLOSE_OBSTACLE");
     return;
   }
 
@@ -211,14 +271,15 @@ void executeMovementControl() {
     return;
   }
 
-  // Compute Differential Drive PWM
-  // Positive (+) steering = Steer Left (Counter-Clockwise) -> Left Motor slower, Right Motor faster
-  // Negative (-) steering = Steer Right (Clockwise) -> Left Motor faster, Right Motor slower
-  float basePwm = targetSpeedScale * 255.0;
-  float turnFactor = (targetSteering / 45.0) * 0.5; // [-0.5 .. +0.5]
+  // Compute Differential Drive PWM with 40% speed reduction and smooth steering
+  float basePwm = targetSpeedScale * 255.0f * SPEED_SCALE_FACTOR;
+  basePwm = constrain(basePwm, 0.0f, (float)MAX_MOTOR_PWM);
 
-  int leftPwm = (int)(basePwm * (1.0 - turnFactor));
-  int rightPwm = (int)(basePwm * (1.0 + turnFactor));
+  // Soften steering factor (0.35) to prevent aggressive jerks or spinning
+  float turnFactor = (targetSteering / 45.0f) * 0.35f; // [-0.35 .. +0.35]
+
+  int leftPwm = (int)(basePwm * (1.0f - turnFactor));
+  int rightPwm = (int)(basePwm * (1.0f + turnFactor));
 
   setMotorSpeeds(leftPwm, rightPwm);
 }
@@ -279,20 +340,20 @@ bool parseSerialCommand(String cmd) {
 }
 
 /**
- * Reads HC-SR04 Ultrasonic Distance in cm
+ * Reads HC-SR04 Ultrasonic Distance in cm with microsecond settling
  */
 long readUltrasonicDistance() {
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(5);
+  delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout (~5 meters)
-  if (duration == 0) {
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000); // 25ms timeout (~4.2 meters)
+  if (duration <= 0) {
     return 999;
   }
-  return (long)(duration * 0.034 / 2.0);
+  return (long)(duration * 0.0343 / 2.0);
 }
 
 /**
@@ -307,26 +368,26 @@ bool initMPU6050() {
 }
 
 /**
- * Checks MPU6050 accelerometer tilt angles
+ * Checks MPU6050 accelerometer tilt angles with I2C error protection
  */
 bool checkIMUSafety() {
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x3B); // Accel data registers
   if (Wire.endTransmission(false) != 0) {
-    return true; // Non-fatal if IMU disconnected
+    return true; // Non-fatal fallback if IMU is offline or wiring is unseated
   }
 
-  if (Wire.requestFrom(MPU6050_ADDR, 6, true) == 6) {
+  if (Wire.requestFrom((uint8_t)MPU6050_ADDR, (size_t)6, (bool)true) == 6) {
     int16_t rawX = (Wire.read() << 8) | Wire.read();
     int16_t rawY = (Wire.read() << 8) | Wire.read();
     int16_t rawZ = (Wire.read() << 8) | Wire.read();
 
-    float ax = rawX / 16384.0;
-    float ay = rawY / 16384.0;
-    float az = rawZ / 16384.0;
+    float ax = rawX / 16384.0f;
+    float ay = rawY / 16384.0f;
+    float az = rawZ / 16384.0f;
 
-    float pitch = atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
-    float roll = atan2(-ax, az) * 180.0 / PI;
+    float pitch = atan2(ay, sqrt(ax * ax + az * az)) * 180.0f / PI;
+    float roll = atan2(-ax, az) * 180.0f / PI;
 
     if (abs(pitch) > MAX_TILT_ANGLE_DEG || abs(roll) > MAX_TILT_ANGLE_DEG) {
       return false; // Excessive tilt detected!
@@ -339,10 +400,10 @@ bool checkIMUSafety() {
  * Sets PWM duty cycle and direction for TB6612FNG driver
  */
 void setMotorSpeeds(int leftPwm, int rightPwm) {
-  leftPwm = constrain(leftPwm, 0, 255);
-  rightPwm = constrain(rightPwm, 0, 255);
+  leftPwm = constrain(leftPwm, 0, MAX_MOTOR_PWM);
+  rightPwm = constrain(rightPwm, 0, MAX_MOTOR_PWM);
 
-  // Forward Direction Polarity (matching hardware/ultrasonic-tfng-auto-test.cpp)
+  // Forward Direction Polarity
   digitalWrite(AIN1, HIGH);
   digitalWrite(AIN2, LOW);
   digitalWrite(BIN1, HIGH);
